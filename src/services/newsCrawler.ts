@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import puppeteer from 'puppeteer';
+import crypto from 'crypto';
 
 export interface NewsItem {
   id: string;
@@ -19,15 +20,18 @@ export interface NewsItem {
 
 interface PionexMarketData {
   symbol: string;
-  price: string;
-  volume: string;
+  lastPrice: string;
   priceChangePercent: string;
+  volume: string;
 }
 
 export class NewsCrawler {
   private readonly PIONEX_BASE_URL = 'https://api.pionex.com/api/v1';
-  private readonly PIONEX_API_KEY = ''; // 需要添加您的 API Key
-  private readonly PIONEX_API_SECRET = ''; // 需要添加您的 API Secret
+  private readonly PIONEX_API_KEY = process.env.PIONEX_API_KEY || '';
+  private readonly PIONEX_API_SECRET = process.env.PIONEX_API_SECRET || '';
+  private marketDataCache: Map<string, PionexMarketData> = new Map();
+  private lastFetchTime: number = 0;
+  private readonly CACHE_DURATION = 180000; // 3分鐘緩存
   private sources = {
     coindesk: {
       url: 'https://www.coindesk.com/arc/outboundfeeds/rss/',
@@ -43,55 +47,86 @@ export class NewsCrawler {
     }
   };
 
+  // 生成 Pionex API 簽名
+  private generateSignature(timestamp: number, method: string, path: string): string {
+    const message = `${timestamp}${method}${path}`;
+    return crypto
+      .createHmac('sha256', this.PIONEX_API_SECRET)
+      .update(message)
+      .digest('hex');
+  }
+
   // 獲取 Pionex 市場數據
-  private async getPionexMarketData(): Promise<Map<string, PionexMarketData>> {
+  private async getMarketData(): Promise<Map<string, PionexMarketData>> {
+    const now = Date.now();
+    
+    // 如果緩存有效，直接返回緩存數據
+    if (this.marketDataCache.size > 0 && now - this.lastFetchTime < this.CACHE_DURATION) {
+      return this.marketDataCache;
+    }
+
     try {
-      const timestamp = Date.now().toString();
-      const headers = {
-        'X-API-Key': this.PIONEX_API_KEY,
-        'X-Timestamp': timestamp,
-        // 需要根據 Pionex API 文檔添加其他必要的認證頭
-      };
+      // 添加延遲以遵守速率限制
+      const timeSinceLastFetch = now - this.lastFetchTime;
+      if (timeSinceLastFetch < 30000) { // 確保至少間隔 30 秒
+        await new Promise(resolve => setTimeout(resolve, 30000 - timeSinceLastFetch));
+      }
 
-      const response = await axios.get(`${this.PIONEX_BASE_URL}/market/tickers`, {
-        headers
-      });
+      const timestamp = Date.now();
+      const path = '/market/tickers';
+      const signature = this.generateSignature(timestamp, 'GET', path);
 
-      const marketData = new Map<string, PionexMarketData>();
+      const response = await axios.get(
+        `${this.PIONEX_BASE_URL}${path}`,
+        {
+          headers: {
+            'X-API-KEY': this.PIONEX_API_KEY,
+            'X-TIMESTAMP': timestamp.toString(),
+            'X-SIGNATURE': signature
+          }
+        }
+      );
+
+      this.marketDataCache.clear();
       
-      if (response.data && Array.isArray(response.data.data)) {
-        response.data.data.forEach((item: any) => {
-          marketData.set(item.symbol.toLowerCase(), {
-            symbol: item.symbol,
-            price: item.last,
-            volume: item.volume,
-            priceChangePercent: item.change
-          });
+      if (response.data && Array.isArray(response.data)) {
+        response.data.forEach((item: any) => {
+          const symbol = item.symbol.toLowerCase();
+          if (['btcusdt', 'ethusdt', 'bnbusdt', 'solusdt', 'dotusdt'].includes(symbol)) {
+            this.marketDataCache.set(symbol.replace('usdt', ''), {
+              symbol: symbol,
+              lastPrice: item.lastPrice,
+              priceChangePercent: item.priceChangePercent,
+              volume: item.volume
+            });
+          }
         });
       }
       
-      return marketData;
+      this.lastFetchTime = Date.now();
+      return this.marketDataCache;
     } catch (error) {
       console.error('Error fetching Pionex market data:', error);
-      return new Map();
+      // 如果請求失敗但有緩存，返回緩存的數據
+      return this.marketDataCache.size > 0 ? this.marketDataCache : new Map();
     }
   }
 
   // 為新聞添加市場數據
   private async enrichNewsWithMarketData(news: NewsItem[]): Promise<NewsItem[]> {
-    const marketData = await this.getPionexMarketData();
+    const marketData = await this.getMarketData();
     
     return news.map(item => {
       const symbols = ['btc', 'eth', 'bnb', 'sol', 'dot'];
       for (const symbol of symbols) {
         if (item.title.toLowerCase().includes(symbol)) {
-          const data = marketData.get(symbol + 'usdt');
+          const data = marketData.get(symbol);
           if (data) {
             return {
               ...item,
               marketData: {
-                price: data.price,
-                change24h: data.priceChangePercent + '%',
+                price: parseFloat(data.lastPrice).toFixed(2),
+                change24h: parseFloat(data.priceChangePercent).toFixed(2) + '%',
                 volume24h: data.volume
               }
             };
