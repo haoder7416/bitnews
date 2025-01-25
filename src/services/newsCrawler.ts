@@ -630,21 +630,15 @@ export class NewsCrawler {
   }
 
   // 新增：分析價格位置
-  private analyzePricePosition(klineData: KlineData[], currentPrice: number): { 
+  private analyzePricePosition(marketData: any): { 
     distanceFromHigh: number;
     distanceFromLow: number;
     highPrice: number;
     lowPrice: number;
   } {
-    if (!klineData.length) return {
-      distanceFromHigh: 0,
-      distanceFromLow: 0,
-      highPrice: 0,
-      lowPrice: 0
-    };
-    
-    const highPrice = Math.max(...klineData.map(k => parseFloat(k.high)));
-    const lowPrice = Math.min(...klineData.map(k => parseFloat(k.low)));
+    const currentPrice = parseFloat(marketData.close);
+    const highPrice = parseFloat(marketData.high);
+    const lowPrice = parseFloat(marketData.low);
     
     // 計算與最高點和最低點的距離（百分比）
     const distanceFromHigh = ((highPrice - currentPrice) / highPrice) * 100;
@@ -676,57 +670,53 @@ export class NewsCrawler {
     
     console.log('開始市場監控篩選...');
 
-    for (const symbol of symbols) {
-      try {
-        console.log(`正在處理 ${symbol}...`);
-        const klineData = await this.getKlineData(symbol);
-        
-        if (!klineData.length) {
-          console.log(`無法獲取 ${symbol} 的 K 線數據`);
-          continue;
+    try {
+      const timestamp = Date.now();
+      const path = '/market/tickers';
+      const signature = this.generateSignature(timestamp, 'GET', path);
+
+      const response = await axios.get(
+        `${this.PIONEX_BASE_URL}${path}`,
+        {
+          headers: {
+            'X-API-KEY': this.PIONEX_API_KEY,
+            'X-TIMESTAMP': timestamp.toString(),
+            'X-SIGNATURE': signature
+          }
         }
+      );
 
-        const currentPrice = parseFloat(klineData[0].close);
-        const priceAnalysis = this.analyzePricePosition(klineData, currentPrice);
-        const volumeIncrease = this.analyzeVolumeChange(klineData);
+      if (response.data?.result && Array.isArray(response.data.data.tickers)) {
+        for (const ticker of response.data.data.tickers) {
+          const symbol = ticker.symbol.toLowerCase().replace('_', '');
+          
+          if (symbols.includes(symbol)) {
+            console.log(`處理 ${symbol} 的市場數據:`, ticker);
+            
+            const priceAnalysis = this.analyzePricePosition(ticker);
+            const volumeIncrease = parseFloat(ticker.volume) / (parseFloat(ticker.volume) * 0.5); // 簡化的成交量計算
 
-        console.log(`${symbol} 分析結果:`, {
-          currentPrice,
-          distanceFromHigh: priceAnalysis.distanceFromHigh.toFixed(2) + '%',
-          distanceFromLow: priceAnalysis.distanceFromLow.toFixed(2) + '%',
-          volumeIncrease: (volumeIncrease * 100).toFixed(2) + '%'
-        });
+            // 檢查是否在最高價或最低價的100%距離內
+            const priceCondition = priceAnalysis.distanceFromHigh <= 100 || priceAnalysis.distanceFromLow <= 100;
 
-        // 檢查是否在最高價或最低價的100%距離內
-        const priceCondition = priceAnalysis.distanceFromHigh <= 100 || priceAnalysis.distanceFromLow <= 100;
-        const volumeCondition = volumeIncrease >= this.VOLUME_INCREASE_THRESHOLD;
-
-        console.log(`${symbol} 條件檢查:`, {
-          priceCondition,
-          volumeCondition,
-          distanceFromHigh: priceAnalysis.distanceFromHigh.toFixed(2) + '%',
-          distanceFromLow: priceAnalysis.distanceFromLow.toFixed(2) + '%',
-          VOLUME_INCREASE_THRESHOLD: this.VOLUME_INCREASE_THRESHOLD
-        });
-
-        // 只要滿足價格條件就添加到結果中
-        if (priceCondition) {
-          console.log(`${symbol} 符合監控條件！`);
-          results.push({
-            symbol: symbol.replace('usdt', '').toUpperCase(),
-            pricePosition: priceAnalysis.distanceFromLow <= 100 ? -1 : 1, // -1 表示接近低點，1 表示接近高點
-            volumeIncrease,
-            lastPrice: klineData[0].close,
-            volume: klineData[0].volume,
-            highPrice: priceAnalysis.highPrice.toString(),
-            lowPrice: priceAnalysis.lowPrice.toString(),
-            distanceFromHigh: priceAnalysis.distanceFromHigh,
-            distanceFromLow: priceAnalysis.distanceFromLow
-          });
+            if (priceCondition) {
+              results.push({
+                symbol: symbol.replace('usdt', '').toUpperCase(),
+                pricePosition: priceAnalysis.distanceFromLow <= 100 ? -1 : 1,
+                volumeIncrease,
+                lastPrice: ticker.close,
+                volume: ticker.volume,
+                highPrice: priceAnalysis.highPrice.toString(),
+                lowPrice: priceAnalysis.lowPrice.toString(),
+                distanceFromHigh: priceAnalysis.distanceFromHigh,
+                distanceFromLow: priceAnalysis.distanceFromLow
+              });
+            }
+          }
         }
-      } catch (error) {
-        console.error(`處理 ${symbol} 時發生錯誤:`, error);
       }
+    } catch (error) {
+      console.error('獲取市場數據時發生錯誤:', error);
     }
 
     console.log(`監控完成，找到 ${results.length} 個符合條件的交易對`);
