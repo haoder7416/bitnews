@@ -62,6 +62,7 @@ export class NewsCrawler {
     
     // 如果緩存有效，直接返回緩存數據
     if (this.marketDataCache.size > 0 && now - this.lastFetchTime < this.CACHE_DURATION) {
+      console.log('Using cached market data:', Object.fromEntries(this.marketDataCache));
       return this.marketDataCache;
     }
 
@@ -76,6 +77,7 @@ export class NewsCrawler {
       const path = '/market/tickers';
       const signature = this.generateSignature(timestamp, 'GET', path);
 
+      console.log('Fetching market data from Pionex...');
       const response = await axios.get(
         `${this.PIONEX_BASE_URL}${path}`,
         {
@@ -87,27 +89,40 @@ export class NewsCrawler {
         }
       );
 
+      // 打印完整的響應數據
+      console.log('Pionex API response tickers:', JSON.stringify(response.data.data.tickers, null, 2));
+
       this.marketDataCache.clear();
       
-      if (response.data && Array.isArray(response.data)) {
-        response.data.forEach((item: any) => {
-          const symbol = item.symbol.toLowerCase();
+      if (response.data?.result && Array.isArray(response.data.data.tickers)) {
+        response.data.data.tickers.forEach((item: any) => {
+          // 將交易對轉換為小寫並移除下劃線
+          const symbol = item.symbol.toLowerCase().replace('_', '');
+          console.log('Processing symbol:', symbol);
+          
+          // 檢查是否是我們需要的交易對
           if (['btcusdt', 'ethusdt', 'bnbusdt', 'solusdt', 'dotusdt'].includes(symbol)) {
-            this.marketDataCache.set(symbol.replace('usdt', ''), {
-              symbol: symbol,
-              lastPrice: item.lastPrice,
-              priceChangePercent: item.priceChangePercent,
+            console.log('Found matching symbol:', symbol, 'with data:', item);
+            
+            // 從交易對中提取基礎貨幣
+            const baseCurrency = symbol.replace('usdt', '');
+            
+            // 存儲市場數據
+            this.marketDataCache.set(baseCurrency, {
+              symbol: baseCurrency,
+              lastPrice: item.close || item.lastPrice, // 使用 close 或 lastPrice
+              priceChangePercent: ((parseFloat(item.close) - parseFloat(item.open)) / parseFloat(item.open) * 100).toFixed(2),
               volume: item.volume
             });
           }
         });
       }
       
+      console.log('Updated market data cache:', Object.fromEntries(this.marketDataCache));
       this.lastFetchTime = Date.now();
       return this.marketDataCache;
     } catch (error) {
       console.error('Error fetching Pionex market data:', error);
-      // 如果請求失敗但有緩存，返回緩存的數據
       return this.marketDataCache.size > 0 ? this.marketDataCache : new Map();
     }
   }
@@ -115,13 +130,25 @@ export class NewsCrawler {
   // 為新聞添加市場數據
   private async enrichNewsWithMarketData(news: NewsItem[]): Promise<NewsItem[]> {
     const marketData = await this.getMarketData();
+    console.log('Market data for enrichment:', Object.fromEntries(marketData));
     
     return news.map(item => {
-      const symbols = ['btc', 'eth', 'bnb', 'sol', 'dot'];
-      for (const symbol of symbols) {
-        if (item.title.toLowerCase().includes(symbol)) {
+      const titleAndDesc = (item.title + ' ' + item.description).toLowerCase();
+      const cryptoKeywords = {
+        'btc': ['btc', 'bitcoin', '比特幣'],
+        'eth': ['eth', 'ethereum', '以太坊'],
+        'bnb': ['bnb', 'binance', '幣安'],
+        'sol': ['sol', 'solana', '索拉納'],
+        'dot': ['dot', 'polkadot', '波卡']
+      };
+
+      console.log(`Checking news item: "${item.title}"`);
+      for (const [symbol, keywords] of Object.entries(cryptoKeywords)) {
+        if (keywords.some(keyword => titleAndDesc.includes(keyword))) {
+          console.log(`Found match for ${symbol} in news item`);
           const data = marketData.get(symbol);
           if (data) {
+            console.log(`Adding market data for ${symbol}:`, data);
             return {
               ...item,
               marketData: {
@@ -130,6 +157,8 @@ export class NewsCrawler {
                 volume24h: data.volume
               }
             };
+          } else {
+            console.log(`No market data found for ${symbol}`);
           }
         }
       }
